@@ -6,10 +6,11 @@ this same shape for Llama models, tool calls included — which is why this
 file has no vendor-specific logic. Point LLAMA_BASE_URL at whichever one
 you're running and nothing else in the backend has to change.
 
-Deliberately not using an agent framework here: this is one call, with an
-optional one-shot tool round-trip (the model asks to navigate, we execute
-it, we ask once more for the final sentence). A single-agent, single-tool
-loop is the whole job — see the README for why multi-agent isn't warranted.
+The chat/tool-calling path here is one call, with an optional one-shot
+tool round-trip (the model asks to navigate, we execute it, we ask once
+more for the final sentence) — that part is deliberately not an agent
+framework, it's the AnsweringAgent's single job. See agents.py for how
+this client is used across the full multi-agent pipeline.
 """
 
 from __future__ import annotations
@@ -30,6 +31,11 @@ class LlamaClient:
         self.base_url = os.getenv("LLAMA_BASE_URL", "http://localhost:11434/v1").rstrip("/")
         self.model = os.getenv("LLAMA_MODEL", "llama3.1")
         self.api_key = os.getenv("LLAMA_API_KEY", "ollama")
+        # Used only by embed() below, for the RetrievalAgent (RAG). bge-base
+        # is Cloudflare Workers AI's default text-embedding model — 768-dim,
+        # good enough for a handful of short page docs, no reason to reach
+        # for anything bigger here.
+        self.embed_model = os.getenv("EMBED_MODEL", "@cf/baai/bge-base-en-v1.5")
 
     def _post(self, messages: list[dict[str, Any]], tools: Optional[list[dict[str, Any]]] = None) -> dict[str, Any]:
         payload: dict[str, Any] = {
@@ -76,6 +82,38 @@ class LlamaClient:
         ]
         resp = self._post(messages)
         return resp["choices"][0]["message"].get("content", "").strip()
+
+    def embed(self, text: str) -> list[float]:
+        """Embeds one string of text — used only by RetrievalAgent (RAG).
+
+        Deliberately a separate code path from _post()/complete(): Workers
+        AI exposes embedding models on its native '/ai/run/<model>' route,
+        not the OpenAI-compatible '/chat/completions' shape the rest of
+        this client speaks. Derives that URL from LLAMA_BASE_URL rather
+        than a second base-url env var, since both are the same Cloudflare
+        account by construction here.
+        """
+        run_base = self.base_url
+        if run_base.endswith("/ai/v1"):
+            run_base = run_base[: -len("/ai/v1")] + "/ai/run"
+        url = f"{run_base}/{self.embed_model}"
+
+        try:
+            resp = requests.post(
+                url,
+                json={"text": [text]},
+                headers={"Authorization": f"Bearer {self.api_key}"},
+                timeout=20,
+            )
+            resp.raise_for_status()
+        except requests.exceptions.RequestException as exc:
+            raise LlamaError(f"Embedding call failed: {exc}") from exc
+
+        data = resp.json()
+        vectors = (data.get("result") or {}).get("data")
+        if not vectors:
+            raise LlamaError(f"Embedding response had no vectors: {data}")
+        return vectors[0]
 
     def chat_with_tool(
         self,

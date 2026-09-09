@@ -1,28 +1,27 @@
 """
-Waypoint backend — a small FastAPI service that answers "what does this
-page do / why is it doing that" questions grounded in (a) durable page docs
-and (b) the caller's live product state, and can act by calling a single
-`navigate` tool. See README.md for the architecture note on why this is one
-agent with one tool, not a multi-agent system.
+Waypoint backend — orchestrates a small sequential multi-agent pipeline to
+answer "what does this page do / why is it doing that" questions, and can
+act by calling a single `navigate` tool. See agents.py for what each agent
+does and why this is a sequential pipeline rather than autonomous peer
+agents, and README.md for the fuller architecture write-up.
 """
 
 from __future__ import annotations
 
 import os
-import re
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 
 import context_store
+from agents import AnsweringAgent, GroundingGuardAgent, RetrievalAgent, ScopeGuardAgent
 from llama_client import LlamaClient, LlamaError
-from page_docs_fallback import GLOSSARY
 from schemas import AskRequest, AskResponse, NavigateAction, PageDoc, SessionMessage
 
 load_dotenv()
 
-app = FastAPI(title="Waypoint", version="0.1.0")
+app = FastAPI(title="Waypoint", version="0.2.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -37,38 +36,6 @@ llama = LlamaClient()
 # (Supabase if configured, otherwise the local fallback) instead of
 # hardcoding the list a second time.
 _known_pages = [d["id"] for d in context_store.list_page_docs()]
-
-
-def _all_pages_context() -> str:
-    """Every page's doc, not just the one the user is currently on.
-
-    The earlier version only ever sent the *current* page's doc, so a
-    question about a different page (or a metric that lives on a different
-    page) was unanswerable — the model literally had no information about
-    anywhere else, so it deflected by navigating without answering. There
-    are only 6 pages, so putting all of them in the prompt every time is
-    cheap and removes that blind spot entirely; if this grew to hundreds of
-    pages, a real retrieval step would replace this function, but nothing
-    else in the request flow would need to change.
-    """
-    docs = context_store.list_page_docs()
-    lines = []
-    for d in docs:
-        lines.append(
-            f"- {d['id']} ({d['title']}): {d['purpose']} "
-            f"[next step: {d['next_step']}]"
-        )
-    return "\n".join(lines)
-
-
-def _glossary_context() -> str:
-    """Named metrics/rules that appear in the UI, so the model can define a
-    specific term a user names instead of guessing or deflecting."""
-    return "\n".join(f"- {term}: {definition}" for term, definition in GLOSSARY.items())
-
-
-_ALL_PAGES_TEXT = _all_pages_context()
-_GLOSSARY_TEXT = _glossary_context()
 
 NAVIGATE_TOOL_SCHEMA = {
     "type": "function",
@@ -85,14 +52,25 @@ NAVIGATE_TOOL_SCHEMA = {
     },
 }
 
+# One instance of each agent, built once at import time and reused across
+# requests — cheap since they're just (client, config) wrappers with no
+# per-request state of their own.
+scope_guard = ScopeGuardAgent(llama)
+retrieval_agent = RetrievalAgent(llama, context_store)
+answering_agent = AnsweringAgent(llama, NAVIGATE_TOOL_SCHEMA, _known_pages)
+grounding_guard = GroundingGuardAgent(llama)
+
 
 @app.get("/api/health")
 def health():
+    using_supabase = context_store.is_using_supabase()
     return {
         "status": "ok",
         "llama_base_url": llama.base_url,
         "llama_model": llama.model,
-        "context_store": "supabase" if context_store.is_using_supabase() else "local_fallback",
+        "embed_model": llama.embed_model,
+        "context_store": "supabase" if using_supabase else "local_fallback",
+        "retrieval": "supabase_pgvector" if using_supabase else "local_cosine_fallback",
     }
 
 
@@ -108,57 +86,6 @@ def get_session_messages(session_id: str):
     return context_store.get_session_messages(session_id)
 
 
-def _is_on_topic(question: str, doc: dict, history: list[dict]) -> bool:
-    """Scope guard: a single classify-only call that runs before the main
-    prompt. Keeps the model from improvising an answer to something that
-    has nothing to do with the product — a cheap, high-value step for
-    cutting down hallucination, and deliberately NOT a second 'agent': it
-    has no tools, makes no decisions beyond yes/no, and never answers the
-    user itself.
-
-    Deliberately biased toward YES: this only sees the page's one-line
-    description, not everything actually shown on it, so an oddly-phrased
-    but legitimate question (e.g. referencing a specific rule name) can
-    look unfamiliar to it. Wrongly declining a real question is a worse
-    failure than letting a borderline one through — the main model still
-    won't invent facts either way, that's its own job. So we only decline
-    on a clear, explicit NO; anything else (including a garbled or
-    hedging response) defaults to letting it through.
-    """
-    context_hint = ""
-    if history:
-        last = history[-1]
-        context_hint = f'Most recent exchange — Q: "{last["question"]}" A: "{last["answer"]}"\n\n'
-
-    guard_system = (
-        "You are a scope guard for Waypoint, an AI guide embedded in a software product. "
-        "You only decide whether a question is in scope — you never answer it. Give the "
-        "user the benefit of the doubt: an odd phrasing, a typo, or a question that names "
-        "a specific feature/rule/term you don't recognize is still IN SCOPE if it could "
-        "plausibly be about using, understanding, or troubleshooting this product or the "
-        "page they're on — including follow-ups to the recent exchange below. Only say NO "
-        "when the question is clearly about something else entirely: general trivia, a "
-        "different product, or a personal request. Reply with exactly one word: YES or NO."
-    )
-    guard_user = (
-        f"PAGE: {doc['title']} — {doc['purpose']}\n"
-        f"{context_hint}"
-        f'QUESTION: "{question}"\n'
-        "In scope? Reply YES or NO only."
-    )
-    try:
-        verdict = llama.complete(guard_system, guard_user)
-    except LlamaError:
-        # If the guard call itself fails, fail open to the main answer path
-        # rather than falsely declining a question over an infra hiccup.
-        return True
-
-    # Only decline on an explicit, standalone "NO" — anything else (a
-    # clean YES, hedging, a garbled non-answer) defaults to letting the
-    # question through, per the bias explained above.
-    return re.search(r"\bno\b", verdict.strip(), re.IGNORECASE) is None
-
-
 @app.post("/api/ask", response_model=AskResponse)
 def ask(req: AskRequest):
     doc = context_store.get_page_doc(req.page)
@@ -168,7 +95,8 @@ def ask(req: AskRequest):
     session_id = req.session_id or context_store.new_session_id()
     history = context_store.get_recent_history(session_id, limit=6)
 
-    if not _is_on_topic(req.question, doc, history):
+    # --- Agent 1: ScopeGuard ------------------------------------------------
+    if not scope_guard.classify(req.question, doc, history):
         decline = (
             f"That's outside what I can help with here — I'm scoped to {doc['title']} "
             "and this product, not general questions. Try asking something about this "
@@ -177,57 +105,44 @@ def ask(req: AskRequest):
         context_store.log_chat_event(session_id, req.page, req.question, decline, None)
         return AskResponse(answer=decline, action=None, grounded_on=[], session_id=session_id)
 
-    system_prompt = (
-        "You are Waypoint, a contextual AI guide embedded inside a software product. "
-        "You answer ONE focused question at a time using only the page docs, glossary, "
-        "and live project state given to you — never invent data that isn't there. "
-        "Answer in 2-4 sentences, be concrete and specific, and if you're not certain of "
-        "a root cause say so plainly instead of guessing.\n\n"
-        "The question may be about a DIFFERENT page than the one the user is currently "
-        "on, or may use a term that isn't the exact metric name — match it to the "
-        "closest real page/term in the glossary below and answer using that page's info "
-        "regardless of where the user currently is. NEVER respond with only 'I moved you "
-        "to X, look there' and no substantive answer — that is not an answer. If moving "
-        "the user to the page that actually has the answer would help, call the "
-        "`navigate` tool AND give the real answer in the same response; the tool result "
-        "does not replace answering. Only stay silent on content if the term genuinely "
-        "doesn't correspond to anything in this product, and say that plainly."
-    )
-
-    user_prompt = (
-        f"CURRENT PAGE: {doc['title']} ({doc['id']})\n"
-        f"WHAT HAS TO BE TRUE FIRST ON THIS PAGE: {doc['prerequisites']}\n\n"
-        f"ALL PAGES IN THIS PRODUCT (use whichever one actually answers the question, "
-        f"not just the current page):\n{_ALL_PAGES_TEXT}\n\n"
-        f"GLOSSARY OF NAMED METRICS/RULES (match the user's wording to these even if "
-        f"they don't use the exact term):\n{_GLOSSARY_TEXT}\n\n"
-        f"LIVE PROJECT STATE (JSON): {req.project_state}\n\n"
-        f'USER QUESTION: "{req.question}"'
-    )
-
-    def execute_navigate(args: dict) -> dict:
-        target = args.get("page")
-        if target not in _known_pages:
-            return {"ok": False, "error": "unknown page"}
-        return {"ok": True, "opened": target}
-
+    # --- Agent 2: Retrieval (RAG) -------------------------------------------
     try:
-        answer_text, executed = llama.chat_with_tool(
-            system_prompt=system_prompt,
-            user_prompt=user_prompt,
-            tool_schema=NAVIGATE_TOOL_SCHEMA,
-            tool_executor=execute_navigate,
+        chunks = retrieval_agent.retrieve(req.question)
+    except LlamaError:
+        chunks = []
+
+    # --- Agent 3: Answering --------------------------------------------------
+    try:
+        answer_text, executed = answering_agent.answer(
+            question=req.question,
+            current_page_id=doc["id"],
+            current_page_prereq=doc["prerequisites"],
+            chunks=chunks,
+            project_state=req.project_state,
             history=history,
         )
     except LlamaError as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
 
+    # --- Agent 4: GroundingGuard ---------------------------------------------
+    if not grounding_guard.verify(answer_text, chunks, req.project_state):
+        answer_text = (
+            "I want to avoid guessing here — I couldn't confirm that against what I "
+            "actually have access to. Could you rephrase, or check this against the "
+            "page directly?"
+        )
+        executed = None
+
     action = None
     if executed and executed["result"].get("ok"):
         action = NavigateAction(page=executed["result"]["opened"])
 
-    context_store.log_chat_event(session_id, req.page, req.question, answer_text, action.model_dump() if action else None)
+    grounded_on = sorted({c["page_id"] for c in chunks}) if chunks else [doc["id"]]
+
+    context_store.log_chat_event(
+        session_id, req.page, req.question, answer_text, action.model_dump() if action else None
+    )
 
     return AskResponse(
-        answer=answer_text, action=action, grounded_on=[doc["id"]], session_id=session_id
+        answer=answer_text, action=action, grounded_on=grounded_on, session_id=session_id
     )

@@ -2,25 +2,23 @@
 Waypoint's context layer.
 
 "Context awareness" for a page-scoped assistant is really three things:
-  1) durable knowledge about what each page is/needs (page_docs)
+  1) durable knowledge about what each page is/needs (page_docs), plus the
+     knowledge_chunks RAG index built from it and from GLOSSARY
   2) what was actually said earlier in this conversation, so a follow-up
      question doesn't reset to zero (chat_events, read back as history)
   3) a way for a user to come back and see a past chat (chat_events, read
      back as a transcript)
 
-Supabase is a reasonable place to put all three: it's a Postgres table away
-from being queryable by the product team, needs no separate service to run,
-and row-level security can scope it per workspace later. This module talks
-to Supabase when it's configured (SUPABASE_URL / SUPABASE_KEY set — see
-supabase.sql for the schema) and falls back to in-process memory otherwise,
-so `uvicorn main:app` works with zero external services. The tradeoff of
-the fallback: it only lives as long as this process does — restart the
-server and history is gone. Filling in the two env vars removes that
-limitation with no code change anywhere else.
-
-If/when the retrieval need grows past "one doc per page" (e.g. searching
-release notes, past incidents), this is the seam where a real vector search
-over a Supabase `pgvector` column would slot in without touching main.py.
+Supabase is a reasonable place to put all three: it's a Postgres table
+(plus pgvector for the knowledge index) away from being queryable by the
+product team, needs no separate service to run, and row-level security
+can scope it per workspace later. This module talks to Supabase when it's
+configured (SUPABASE_URL / SUPABASE_KEY set — see supabase.sql for the
+schema) and falls back to in-process memory otherwise, so `uvicorn
+main:app` works with zero external services. The tradeoff of the
+fallback: it only lives as long as this process does — restart the server
+and history (and the embedded knowledge cache) are gone. Filling in the
+two env vars removes that limitation with no code change anywhere else.
 """
 
 from __future__ import annotations
@@ -30,7 +28,7 @@ import uuid
 from datetime import datetime, timezone
 from typing import Any, Optional
 
-from page_docs_fallback import PAGE_DOCS
+from page_docs_fallback import GLOSSARY, PAGE_DOCS
 
 _supabase_client = None
 _supabase_enabled = False
@@ -144,6 +142,94 @@ def get_recent_history(session_id: str, limit: int = 6) -> list[dict[str, Any]]:
 
     rows = _local_chat_log.get(session_id, [])
     return rows[-limit:]
+
+
+def list_knowledge_chunks() -> list[dict[str, Any]]:
+    """Every chunk the RetrievalAgent can retrieve: one per page field, plus
+    one per glossary term. This is what seed_knowledge.py embeds and
+    upserts into Supabase's `knowledge_chunks` table, and what the local
+    fallback below embeds into memory when Supabase isn't configured — the
+    same chunk set either way, just a different place the vectors live."""
+    chunks: list[dict[str, Any]] = []
+    for page_id, doc in PAGE_DOCS.items():
+        for kind in ("purpose", "prerequisites", "next_step"):
+            chunks.append(
+                {
+                    "page_id": page_id,
+                    "kind": kind,
+                    "label": doc["title"],
+                    "content": f"{doc['title']} — {kind.replace('_', ' ')}: {doc[kind]}",
+                }
+            )
+    for term, definition in GLOSSARY.items():
+        chunks.append(
+            {
+                "page_id": "glossary",
+                "kind": "glossary",
+                "label": term,
+                "content": f"{term}: {definition}",
+            }
+        )
+    return chunks
+
+
+# In-process cache of {chunk fields..., "embedding": [...]}, built lazily
+# on first use when Supabase isn't configured. Costs one embed() call per
+# chunk, once per process lifetime, not per request.
+_local_chunk_cache: Optional[list[dict[str, Any]]] = None
+
+
+def _cosine(a: list[float], b: list[float]) -> float:
+    dot = sum(x * y for x, y in zip(a, b))
+    norm_a = sum(x * x for x in a) ** 0.5
+    norm_b = sum(y * y for y in b) ** 0.5
+    return dot / (norm_a * norm_b) if norm_a and norm_b else 0.0
+
+
+def search_knowledge(
+    query_embedding: list[float], embed_fn, top_k: int = 5
+) -> list[dict[str, Any]]:
+    """RetrievalAgent's core operation: vector-similarity search over
+    knowledge_chunks. Uses Supabase pgvector (via the `match_knowledge` SQL
+    function in supabase.sql) when configured — exact, index-accelerated,
+    and shared across every backend instance. Otherwise embeds the small
+    fixed chunk set once into an in-process cache and does the identical
+    cosine search in plain Python: same retrieval semantics, so behavior
+    doesn't change based on which store happens to be configured, no
+    external vector database required to run this locally with zero
+    services set up.
+    """
+    client = _get_client()
+    if client is not None:
+        try:
+            res = client.rpc(
+                "match_knowledge",
+                {"query_embedding": query_embedding, "match_count": top_k},
+            ).execute()
+            if res.data:
+                return res.data
+        except Exception:
+            # match_knowledge not created yet / RLS denial / network hiccup
+            # — degrade to the local fallback below instead of failing the
+            # whole request over a retrieval-layer problem.
+            pass
+
+    global _local_chunk_cache
+    if _local_chunk_cache is None:
+        _local_chunk_cache = [
+            {**chunk, "embedding": embed_fn(chunk["content"])}
+            for chunk in list_knowledge_chunks()
+        ]
+
+    scored = [
+        {
+            **{k: v for k, v in c.items() if k != "embedding"},
+            "similarity": _cosine(query_embedding, c["embedding"]),
+        }
+        for c in _local_chunk_cache
+    ]
+    scored.sort(key=lambda r: r["similarity"], reverse=True)
+    return scored[:top_k]
 
 
 def get_session_messages(session_id: str) -> list[dict[str, Any]]:

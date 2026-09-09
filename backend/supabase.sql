@@ -56,3 +56,40 @@ on conflict (id) do update set
   purpose = excluded.purpose,
   prerequisites = excluded.prerequisites,
   next_step = excluded.next_step;
+
+-- RAG: real vector search for the RetrievalAgent, not a static dump of
+-- every doc into every prompt. pgvector ships with Supabase; this just
+-- turns it on for this project.
+create extension if not exists vector;
+
+create table if not exists knowledge_chunks (
+  id uuid primary key default gen_random_uuid(),
+  page_id text not null,
+  kind text not null,        -- 'purpose' | 'prerequisites' | 'next_step' | 'glossary'
+  label text not null,       -- page title, or glossary term
+  content text not null,
+  embedding vector(768)      -- @cf/baai/bge-base-en-v1.5 output size
+);
+
+create index if not exists knowledge_chunks_embedding_idx
+  on knowledge_chunks using ivfflat (embedding vector_cosine_ops) with (lists = 50);
+
+-- Called by context_store.search_knowledge() via client.rpc(...). Kept as
+-- a SQL function (not a client-side query) because Supabase's REST layer
+-- can't express "order by vector distance" on its own — this is the
+-- standard pgvector + Supabase pattern for similarity search.
+create or replace function match_knowledge(query_embedding vector(768), match_count int default 5)
+returns table (id uuid, page_id text, kind text, label text, content text, similarity float)
+language sql stable
+as $$
+  select id, page_id, kind, label, content,
+         1 - (embedding <=> query_embedding) as similarity
+  from knowledge_chunks
+  order by embedding <=> query_embedding
+  limit match_count;
+$$;
+
+-- Populate knowledge_chunks by running `python seed_knowledge.py` once
+-- (after SUPABASE_URL/SUPABASE_KEY are set in backend/.env) — it embeds
+-- the same content page_docs_fallback.py defines and upserts it here.
+-- Re-run it any time that file's content changes.
