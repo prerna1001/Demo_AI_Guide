@@ -9,6 +9,7 @@ agent with one tool, not a multi-agent system.
 from __future__ import annotations
 
 import os
+import re
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
@@ -80,19 +81,31 @@ def _is_on_topic(question: str, doc: dict, history: list[dict]) -> bool:
     has nothing to do with the product — a cheap, high-value step for
     cutting down hallucination, and deliberately NOT a second 'agent': it
     has no tools, makes no decisions beyond yes/no, and never answers the
-    user itself."""
+    user itself.
+
+    Deliberately biased toward YES: this only sees the page's one-line
+    description, not everything actually shown on it, so an oddly-phrased
+    but legitimate question (e.g. referencing a specific rule name) can
+    look unfamiliar to it. Wrongly declining a real question is a worse
+    failure than letting a borderline one through — the main model still
+    won't invent facts either way, that's its own job. So we only decline
+    on a clear, explicit NO; anything else (including a garbled or
+    hedging response) defaults to letting it through.
+    """
     context_hint = ""
     if history:
         last = history[-1]
         context_hint = f'Most recent exchange — Q: "{last["question"]}" A: "{last["answer"]}"\n\n'
 
     guard_system = (
-        "You are a strict scope guard for Waypoint, an AI guide embedded in a software "
-        "product. You only decide whether a question is in scope — you never answer it. "
-        "In scope: anything about using, understanding, or troubleshooting this product "
-        "or the page the user is on, including reasonable follow-ups to the recent "
-        "exchange below. Out of scope: general knowledge, other products, personal "
-        "requests, or anything unrelated. Reply with exactly one word: YES or NO."
+        "You are a scope guard for Waypoint, an AI guide embedded in a software product. "
+        "You only decide whether a question is in scope — you never answer it. Give the "
+        "user the benefit of the doubt: an odd phrasing, a typo, or a question that names "
+        "a specific feature/rule/term you don't recognize is still IN SCOPE if it could "
+        "plausibly be about using, understanding, or troubleshooting this product or the "
+        "page they're on — including follow-ups to the recent exchange below. Only say NO "
+        "when the question is clearly about something else entirely: general trivia, a "
+        "different product, or a personal request. Reply with exactly one word: YES or NO."
     )
     guard_user = (
         f"PAGE: {doc['title']} — {doc['purpose']}\n"
@@ -106,7 +119,11 @@ def _is_on_topic(question: str, doc: dict, history: list[dict]) -> bool:
         # If the guard call itself fails, fail open to the main answer path
         # rather than falsely declining a question over an infra hiccup.
         return True
-    return verdict.strip().upper().startswith("Y")
+
+    # Only decline on an explicit, standalone "NO" — anything else (a
+    # clean YES, hedging, a garbled non-answer) defaults to letting the
+    # question through, per the bias explained above.
+    return re.search(r"\bno\b", verdict.strip(), re.IGNORECASE) is None
 
 
 @app.post("/api/ask", response_model=AskResponse)
