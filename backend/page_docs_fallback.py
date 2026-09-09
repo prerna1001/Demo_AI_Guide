@@ -7,6 +7,12 @@ product team can edit the copy without a redeploy.
 Each entry is what a first-time user would actually need to know: what the
 page is for, what has to be true before it does anything useful, and the
 one thing to do next.
+
+This copy is deliberately original, not lifted from any real product's
+docs — Waypoint's host app here ("Aperture") is an invented example, and
+the terminology below (traces, guardrails, evaluators) is generic to the
+AI-observability category rather than describing one specific vendor's
+actual feature set.
 """
 
 PAGE_DOCS = {
@@ -18,7 +24,7 @@ PAGE_DOCS = {
     },
     "traces": {
         "title": "Traces",
-        "purpose": "Inspect one model interaction end to end: input, output, latency, model identity, and every guardrail finding tied to that run.",
+        "purpose": "Inspect one model interaction end to end: input, output, latency, model identity, an automatic quality score, and every guardrail finding tied to that run.",
         "prerequisites": "At least one event has to have arrived from the SDK. If none have, this page is empty by design, not broken.",
         "next_step": "Start here right after your integration sends its first event.",
     },
@@ -42,7 +48,7 @@ PAGE_DOCS = {
     },
     "guardrails": {
         "title": "Guardrails",
-        "purpose": "Rules that flag or block behavior in production. The tester lets you validate a rule safely before it can block anything.",
+        "purpose": "Rules that flag or block specific policy violations — things like exposed personal data, unsafe content, or off-topic responses — in production. The tester lets you validate a rule safely before it can block anything.",
         "prerequisites": "None to view; moving a rule from flagging to blocking should only happen after Test Guardrails confirms it behaves as expected.",
         "next_step": "If the tester's result ever disagrees with what a live trace actually showed, treat that as a bug to report, not a fluke.",
     },
