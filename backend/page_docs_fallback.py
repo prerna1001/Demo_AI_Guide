@@ -47,3 +47,38 @@ PAGE_DOCS = {
         "next_step": "If the tester's result ever disagrees with what a live trace actually showed, treat that as a bug to report, not a fluke.",
     },
 }
+
+# Named metrics/concepts that actually appear in the product's UI, kept
+# separate from PAGE_DOCS because they cut across pages (e.g. "Tool Use
+# Quality" is scored on Agent Intelligence but explained by a rule on Agent
+# Runs). Without this, the model has no way to answer a question about a
+# specific term unless that exact string happens to be in the one-line
+# page purpose above — which is how a legitimate question like "what is
+# tool call match" ended up unanswerable. Kept here (not Supabase) since
+# it's product copy, not something a user's session ever changes.
+GLOSSARY = {
+    "Tool Use Quality": (
+        "An Agent Intelligence dimension: did the agent call the right tool, with "
+        "the right arguments, at the right point in the conversation. Shown as a "
+        "before/after percentage. There's no separate metric called 'tool call "
+        "match' — this is the closest one in the product; if a user asks about "
+        "tool call matching, answer using this."
+    ),
+    "Grounding": (
+        "An Agent Intelligence dimension: whether the agent's answer is actually "
+        "supported by the retrieved context/tool output it had, versus invented."
+    ),
+    "Instruction Adherence": (
+        "An Agent Intelligence dimension: whether the agent followed the "
+        "system/developer instructions it was given for that run."
+    ),
+    "Rule status on Agent Runs": (
+        "Each row is one guardrail rule evaluated against one run. Status is "
+        "one of: passed, failed, or not applicable (the rule's trigger condition "
+        "never matched this run, e.g. a voice-consent rule on a run with no audio)."
+    ),
+    "PII/PHI detection": (
+        "A guardrail rule category (Traces/Guardrails) that flags personally "
+        "identifiable or health information in a trace's input/output."
+    ),
+}

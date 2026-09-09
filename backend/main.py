@@ -17,6 +17,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 import context_store
 from llama_client import LlamaClient, LlamaError
+from page_docs_fallback import GLOSSARY
 from schemas import AskRequest, AskResponse, NavigateAction, PageDoc, SessionMessage
 
 load_dotenv()
@@ -37,11 +38,43 @@ llama = LlamaClient()
 # hardcoding the list a second time.
 _known_pages = [d["id"] for d in context_store.list_page_docs()]
 
+
+def _all_pages_context() -> str:
+    """Every page's doc, not just the one the user is currently on.
+
+    The earlier version only ever sent the *current* page's doc, so a
+    question about a different page (or a metric that lives on a different
+    page) was unanswerable — the model literally had no information about
+    anywhere else, so it deflected by navigating without answering. There
+    are only 6 pages, so putting all of them in the prompt every time is
+    cheap and removes that blind spot entirely; if this grew to hundreds of
+    pages, a real retrieval step would replace this function, but nothing
+    else in the request flow would need to change.
+    """
+    docs = context_store.list_page_docs()
+    lines = []
+    for d in docs:
+        lines.append(
+            f"- {d['id']} ({d['title']}): {d['purpose']} "
+            f"[next step: {d['next_step']}]"
+        )
+    return "\n".join(lines)
+
+
+def _glossary_context() -> str:
+    """Named metrics/rules that appear in the UI, so the model can define a
+    specific term a user names instead of guessing or deflecting."""
+    return "\n".join(f"- {term}: {definition}" for term, definition in GLOSSARY.items())
+
+
+_ALL_PAGES_TEXT = _all_pages_context()
+_GLOSSARY_TEXT = _glossary_context()
+
 NAVIGATE_TOOL_SCHEMA = {
     "type": "function",
     "function": {
         "name": "navigate",
-        "description": "Switch the product to a different page when that page would actually resolve the user's question.",
+        "description": "Switch the product to a different page that has the answer. Call this ALONGSIDE writing the real answer as text, never in place of it — the user should get the answer and the navigation together, not one or the other.",
         "parameters": {
             "type": "object",
             "properties": {
@@ -146,18 +179,28 @@ def ask(req: AskRequest):
 
     system_prompt = (
         "You are Waypoint, a contextual AI guide embedded inside a software product. "
-        "You answer ONE focused question at a time using only the page doc and live "
-        "project state given to you — never invent data that isn't there. Answer in "
-        "2-4 sentences, be concrete and specific, and if you're not certain of a root "
-        "cause say so plainly instead of guessing. Call the `navigate` tool only when "
-        "moving the user to a different page would actually help resolve their question."
+        "You answer ONE focused question at a time using only the page docs, glossary, "
+        "and live project state given to you — never invent data that isn't there. "
+        "Answer in 2-4 sentences, be concrete and specific, and if you're not certain of "
+        "a root cause say so plainly instead of guessing.\n\n"
+        "The question may be about a DIFFERENT page than the one the user is currently "
+        "on, or may use a term that isn't the exact metric name — match it to the "
+        "closest real page/term in the glossary below and answer using that page's info "
+        "regardless of where the user currently is. NEVER respond with only 'I moved you "
+        "to X, look there' and no substantive answer — that is not an answer. If moving "
+        "the user to the page that actually has the answer would help, call the "
+        "`navigate` tool AND give the real answer in the same response; the tool result "
+        "does not replace answering. Only stay silent on content if the term genuinely "
+        "doesn't correspond to anything in this product, and say that plainly."
     )
 
     user_prompt = (
         f"CURRENT PAGE: {doc['title']} ({doc['id']})\n"
-        f"WHAT THIS PAGE DOES: {doc['purpose']}\n"
-        f"WHAT HAS TO BE TRUE FIRST: {doc['prerequisites']}\n"
-        f"RECOMMENDED NEXT STEP: {doc['next_step']}\n\n"
+        f"WHAT HAS TO BE TRUE FIRST ON THIS PAGE: {doc['prerequisites']}\n\n"
+        f"ALL PAGES IN THIS PRODUCT (use whichever one actually answers the question, "
+        f"not just the current page):\n{_ALL_PAGES_TEXT}\n\n"
+        f"GLOSSARY OF NAMED METRICS/RULES (match the user's wording to these even if "
+        f"they don't use the exact term):\n{_GLOSSARY_TEXT}\n\n"
         f"LIVE PROJECT STATE (JSON): {req.project_state}\n\n"
         f'USER QUESTION: "{req.question}"'
     )
