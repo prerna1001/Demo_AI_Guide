@@ -54,31 +54,8 @@ this problem shape.
    be careful.
 
 ## Architecture
-
-```
-frontend/  React (Vite) — the host app UI + the Waypoint tour and ask panel
-backend/   FastAPI — /api/ask orchestrates agents.py, grounded via context_store.py
-```
-
-```
-User question
-     │
-     ▼
-ScopeGuardAgent ──(out of scope)──► decline, log, return
-     │ in scope
-     ▼
-RetrievalAgent ──► embed question (Cloudflare Workers AI) ──► vector search
-     │                                                        (Supabase pgvector,
-     │                                                         or local cosine fallback)
-     ▼
-AnsweringAgent ──► LLM + `navigate` tool ──► draft answer (+ optional navigation)
-     │
-     ▼
-GroundingGuardAgent ──(not grounded)──► replace with honest "can't confirm that"
-     │ grounded
-     ▼
-log to chat_events (Supabase or in-memory) ──► response to the user
-```
+<img width="892" height="724" alt="Screenshot 2026-09-09 at 5 45 27 PM" src="https://github.com/user-attachments/assets/be854cfa-e7ee-47d9-bebd-36359925481f" />
+<img width="892" height="724" alt="Screenshot 2026-09-09 at 5 45 46 PM" src="https://github.com/user-attachments/assets/f244eebc-17ba-4e2b-b4ee-bfda7ed52f1a" />
 
 - **LLM: Llama**, via any OpenAI-chat-completions-shaped endpoint —
   `backend/llama_client.py` has no vendor-specific code for the chat path,
